@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	mapset "github.com/deckarep/golang-set"
 	"github.com/go-logr/logr"
 	"github.com/hashicorp/consul/api"
 	corev1 "k8s.io/api/core/v1"
@@ -18,9 +19,17 @@ import (
 // todo: add docs
 type EndpointsController struct {
 	client.Client
+	// ConsulClient points at the agent local to the connect-inject deployment pod
 	ConsulClient *api.Client
-	Log          logr.Logger
-	Scheme       *runtime.Scheme
+	// ConsulScheme is the scheme to use when making API calls to Consul,
+	// i.e. "http" or "https".
+	ConsulScheme string
+	// ConsulPort is the port to make HTTP API calls to Consul agents on.
+	ConsulPort            string
+	AllowK8sNamespacesSet mapset.Set
+	DenyK8sNamespacesSet  mapset.Set
+	Log                   logr.Logger
+	Scheme                *runtime.Scheme
 }
 
 // TODOs:
@@ -28,28 +37,45 @@ type EndpointsController struct {
 func (r *EndpointsController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	var serviceEndpoints corev1.Endpoints
 
-	// todo: ignore the same namespaces as connect-inject
+	// Ignore namespaces where we don't connect-inject.
+	// Ignores system namespaces.
 	if req.Namespace == "kube-system" || req.Namespace == "local-path-storage" {
 		return ctrl.Result{}, nil
 	}
+	// Ignores deny list.
+	if r.DenyK8sNamespacesSet.Contains(req.Namespace) {
+		return ctrl.Result{}, nil
+	}
+	// Ignores if not in allow list or allow list is not *.
+	if r.AllowK8sNamespacesSet.Contains("*") && !r.AllowK8sNamespacesSet.Contains(req.Namespace) {
+		return ctrl.Result{}, nil
+	}
+
 	proxyServiceName := fmt.Sprintf("%s-sidecar-proxy", req.Name)
 	err := r.Client.Get(context.Background(), req.NamespacedName, &serviceEndpoints)
 
-	// If the endpoints object has been deleted, we need to deregister all instances for that service
+	// If the endpoints object has been deleted, we need to deregister all instances for that service.
 	if k8serrors.IsNotFound(err) {
 		for _, name := range []string{req.Name, proxyServiceName} {
+			// ? Q: annotationService, vs 1st container name on pod vs actual K8s svc name??
 			// todo: handle a case when the name has been overwritten by the annotation
+			// in delete, we would get the k8s svc name from metadata on svc instance
+			// in create/update, we would get it from the pod annotation
+			// Always query based on metadata rather than name
+			// To filter based on name, we need to either use the Agent endpoint on every agent or query all services and then use service with the query meta
 			serviceInstances, _, err := r.ConsulClient.Catalog().Service(name, "", nil)
 			if err != nil {
 				r.Log.Error(err, "failed to get service instances from Consul", "name", name)
 				return ctrl.Result{}, err
 			}
 			for _, instance := range serviceInstances {
-				agentClient, err := getConsulClient(instance.Address) // this is the pod IP of the consul client agent rather than service address
+				// ? Q: why do we need this? why not use r.ConsulClient? wouldn't this be pod ip of the svc instance??
+				agentClient, err := r.getConsulClient(instance.Address) // this is the pod IP of the consul client agent rather than service address
 				if err != nil {
 					r.Log.Error(err, "failed to create a new Consul client", "address", instance.Address)
 					return ctrl.Result{}, err
 				}
+				// ? Q: are we deregistering the service multiple times? per instance rather than per svc?
 				r.Log.Info("deregistering service", "service", instance.ServiceName)
 				err = agentClient.Agent().ServiceDeregister(instance.ServiceID)
 				if err != nil {
@@ -57,7 +83,6 @@ func (r *EndpointsController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 					return ctrl.Result{}, err
 				}
 			}
-
 
 			return ctrl.Result{}, nil
 		}
@@ -85,9 +110,11 @@ func (r *EndpointsController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 					return ctrl.Result{}, err
 				}
 
+				// ? Q: will this be set in time
+				// "has it been injected"
 				if r.willBeInjected(&pod) {
 					// get consul client
-					client, err := getConsulClient(pod.Status.HostIP)
+					client, err := r.getConsulClient(pod.Status.HostIP)
 					if err != nil {
 						r.Log.Error(err, "failed to create a new Consul client", "address", pod.Status.HostIP)
 						return ctrl.Result{}, err
@@ -103,11 +130,11 @@ func (r *EndpointsController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 					serviceID := fmt.Sprintf("%s-%s", pod.Name, serviceEndpoints.Name)
 					service := &api.AgentServiceRegistration{
 						ID:        serviceID,
-						Name:      serviceEndpoints.Name,
-						Tags:      nil, // todo: process tags from annotations
+						Name:      serviceEndpoints.Name, // todo handle annotation
+						Tags:      nil,                   // todo: process tags from annotations
 						Port:      servicePort,
 						Address:   pod.Status.PodIP,
-						Meta:      map[string]string{"pod-name": pod.Name}, // todo process user-provided meta tag; it's missing the latest metadata for k8s-namespace
+						Meta:      map[string]string{"pod-name": pod.Name}, // todo process user-provided meta tag; it's missing the latest metadata for k8s-service-name, k8s-namespace
 						Namespace: "",                                      // todo deal with namespaces
 					}
 					r.Log.Info("registering service", "service", service)
@@ -246,9 +273,9 @@ func (r *EndpointsController) willBeInjected(pod *corev1.Pod) bool {
 }
 
 // getConsulClient returns an *api.Client that points at the consul agent local to the pod.
-func getConsulClient(ip string) (*api.Client, error) {
+func (r *EndpointsController) getConsulClient(ip string) (*api.Client, error) {
 	// todo: un-hardcode the scheme and port
-	newAddr := fmt.Sprintf("%s://%s:%s", "http", ip, "8500")
+	newAddr := fmt.Sprintf("%s://%s:%s", r.ConsulScheme, ip, r.ConsulPort)
 	localConfig := api.DefaultConfig()
 	localConfig.Address = newAddr
 
