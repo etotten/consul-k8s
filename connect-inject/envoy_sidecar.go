@@ -198,7 +198,7 @@ const sidecarPreStopCommandTpl = `
   {{- if .ConsulNamespace }}
   -namespace="{{ .ConsulNamespace }}" \
   {{- end }}
-  /consul/connect-inject/service.hcl
+  /consul/connect-inject/service.hcl && sleep 10
 
 {{- if .AuthMethod }}
 /consul/connect-inject/consul logout \
