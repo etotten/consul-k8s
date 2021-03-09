@@ -10,7 +10,7 @@ GOTOOLS = \
 	golang.org/x/tools/cmd/cover \
 	golang.org/x/tools/cmd/stringer
 
-DEV_IMAGE?=consul-k8s-dev
+DEV_IMAGE?=consul-k8s-0.20.0-tottene-1
 GO_BUILD_TAG?=consul-k8s-build-go
 GIT_COMMIT?=$(shell git rev-parse --short HEAD)
 GIT_DIRTY?=$(shell test -n "`git status --porcelain`" && echo "+CHANGES" || true)
